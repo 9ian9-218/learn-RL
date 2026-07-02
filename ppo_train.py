@@ -163,7 +163,7 @@ def compute_policy_loss(log_probs, old_log_probs, advantages, action_mask=None, 
 
 def compute_value_loss(values, old_values, returns, action_mask=None, clip_eps: float = None):
     """
-    价值函数损失：让 Critic 预测值接近实际回报 G_t。
+    价值函数损失：让 Critic 预测值接近实际回报 Gloss = -torch.min(surr1, surr2)_t。
 
     基础形式（MSE）:
         L^VF = (V_θ(s_t) - G_t)²
@@ -229,6 +229,10 @@ class ExperienceBuffer:
             self.buffer = self.buffer[len(self.buffer) - self.limit:]
 
     def get_batches(self, batch_size):
+        """
+        从缓冲区中随机采样 batch_size 条经验，返回组成一个 batch。
+        这里通过 random.sample 随机从 buffer 列表中采样 batch_size 个元素，实现打乱采样（多 epoch 时有利于充分利用数据）。
+        """
         return random.sample(self.buffer, batch_size)
 
     def clear(self):
@@ -290,6 +294,18 @@ def compute_approx_kl(
 
     在 RLHF 中，KL 惩罚防止微调后的策略偏离 SFT 参考模型太远，
     避免"奖励黑客"（reward hacking）导致输出退化。
+
+    参数:
+        log_probs: (batch_size, num_actions) 张量。
+            每个元素 log_probs[i, j] 表示第 i 个样本第 j 个 token（动作位置）下，当前策略生成该 token 的 log 概率。
+        ref_log_probs: (batch_size, num_actions) 张量。
+            每个元素 ref_log_probs[i, j] 表示第 i 个样本第 j 个 token 下，参考策略生成该 token 的 log 概率。
+        action_mask: (batch_size, num_actions) 张量（可选）。
+            指示每个位置是否为有效动作（True/1）；padding 位置为 0。
+
+    返回:
+        log_ratio: (batch_size, num_actions) 张量。
+            每个有效动作位置的对数概率差值（即近似 KL）。
     """
     log_ratio = log_probs.float() - ref_log_probs.float()
     if action_mask is not None:
