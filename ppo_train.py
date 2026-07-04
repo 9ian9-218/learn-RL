@@ -43,7 +43,7 @@ import torch
 import torch.nn.functional as F  # 常用函数：log_softmax、softmax 等
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.utils.tensorboard import SummaryWriter  # 训练曲线可视化
+import swanlab
 
 
 # =============================================================================
@@ -101,6 +101,7 @@ class Critic(nn.Module):
         self.base_model.eval()             # rollout 阶段 Critic 只做推理，不更新 backbone 的 BN/Dropout 行为
         # 回归头：hidden_size → 1，每个位置输出一个标量价值
         self.value_head = nn.Linear(base_model.config.hidden_size, 1)
+        self.value_head.to(dtype=next(base_model.parameters()).dtype)
 
     def forward(self, input_ids, attention_mask, num_actions):
         """
@@ -663,7 +664,7 @@ def train_step(experience, steps):
     )
     policy_loss.backward()
     optimizer_actor.step()
-    writer.add_scalar("policy_loss", policy_loss.item(), steps)
+    # writer.add_scalar("policy_loss", policy_loss.item(), steps)
 
     # ── 更新 Critic（价值网络）──
     critic_model.train()
@@ -672,7 +673,11 @@ def train_step(experience, steps):
     value_loss = compute_value_loss(values, old_values, returns, action_mask)
     value_loss.backward()
     optimizer_critic.step()
-    writer.add_scalar("value_loss", value_loss.item(), steps)
+    # writer.add_scalar("value_loss", value_loss.item(), steps)
+    swanlab.log({
+        "policy_loss": policy_loss.item(),
+        "value_loss": value_loss.item(),
+    }, step=steps)
     print(f"step: {steps}  policy_loss: {policy_loss.item():.4f}  value_loss: {value_loss.item():.4f}")
 
 
@@ -742,25 +747,40 @@ if __name__ == "__main__":
     max_new_tokens = 50           # 最多生成 50 个 token（= 最大动作步数）
     max_length = 256              # prompt 最大 token 长度
     micro_train_batch_size = 2    # 训练时 micro-batch=2
-
-    writer = SummaryWriter('./runs')  # TensorBoard 日志目录
+    from torch.utils.tensorboard import SummaryWriter  # 训练曲线可视化
+    # writer = SummaryWriter('./runs')  # TensorBoard 日志目录
+    swanlab.init(
+        project="learn-RL-ppo",
+        experiment_name="ppo-qwen2.5-0.5b",
+        logdir="./swanlog",
+    )
+    swanlab.config.update({
+        "episodes": episodes,
+        "max_epochs": max_epochs,
+        "rollout_batch_size": rollout_batch_size,
+        "micro_rollout_batch_size": micro_rollout_batch_size,
+        "n_samples_per_prompt": n_samples_per_prompt,
+        "max_new_tokens": max_new_tokens,
+        "max_length": max_length,
+        "micro_train_batch_size": micro_train_batch_size,
+    })
 
     # ── 四个模型 ──
     # Actor：要被 RL 微调的策略模型（生成 response）
     actor_model = AutoModelForCausalLM.from_pretrained(
-        '/home/user/Downloads/Qwen2.5-0.5B-Instruct'
+        '/home/z9ian9/downloads/models/Qwen/Qwen2.5-0.5B-Instruct'
     ).to(device)
     # Ref：冻结的参考模型（SFT 副本），仅用于 KL 惩罚，参数不更新
     ref_model = AutoModelForCausalLM.from_pretrained(
-        '/home/user/Downloads/Qwen2.5-0.5B-Instruct'
+        '/home/z9ian9/downloads/models/Qwen/Qwen2.5-0.5B-Instruct'
     ).to(device)
     # Reward Model：人类偏好训练的打分模型，评估 response 质量
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        '/home/user/Downloads/reward-model-deberta-v3-large-v2'
+        '/home/z9ian9/downloads/models/OpenAssistant/reward-model-deberta-v3-large-v2'
     ).to(device)
 
-    actor_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/Qwen2.5-0.5B-Instruct')
-    reward_tokenizer = AutoTokenizer.from_pretrained('/home/user/Downloads/reward-model-deberta-v3-large-v2')
+    actor_tokenizer = AutoTokenizer.from_pretrained('/home/z9ian9/downloads/models/Qwen/Qwen2.5-0.5B-Instruct')
+    reward_tokenizer = AutoTokenizer.from_pretrained('/home/z9ian9/downloads/models/OpenAssistant/reward-model-deberta-v3-large-v2')
 
     # Critic：价值网络，复用 Actor backbone + 线性头
     critic_model = Critic(actor_model.base_model).to(device)
@@ -789,3 +809,4 @@ if __name__ == "__main__":
     prompts_dataloader = DataLoader(prompts_dataset, batch_size=rollout_batch_size, shuffle=True)
 
     train()
+    swanlab.finish()
