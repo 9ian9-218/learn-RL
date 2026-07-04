@@ -454,11 +454,13 @@ def compute_rewards(kl, r, action_mask, kl_ctl, clip_reward_value):
         clip_reward_value: 对奖励模型分数做 clip，防极端值
     """
     # 逐步 KL 惩罚 reward（每个 token 位置都有）
-    kl_divergence_estimate = -kl_ctl * kl
-    rewards = kl_divergence_estimate
+    # kl 的形状: (batch, num_actions)
+    # kl_ctl 的形状: 标量或 (1,)
+    kl_divergence_estimate = -kl_ctl * kl            # 形状: (batch, num_actions)
+    rewards = kl_divergence_estimate                 # 形状: (batch, num_actions)
 
     # 每条样本 response 的有效长度（最后一个非 pad 位置索引 +1）
-    ends = action_mask.sum(1)
+    ends = action_mask.sum(1)# 形状: (batch,1)
 
     if not isinstance(clip_reward_value, torch.Tensor):
         clip_reward_value = torch.tensor(clip_reward_value).to(r.device)
@@ -469,9 +471,14 @@ def compute_rewards(kl, r, action_mask, kl_ctl, clip_reward_value):
     batch_size = r.size(0)
     for j in range(batch_size):
         # 将序列级奖励加到最后一个有效 action 位置
-        # GAE 会从该位置向前传播，让前面 token 也获得信用分配信号
+        # 只有最后一个 token 获得奖励信号，后续 GAE 算法会将该信号向前分配
         rewards[j, :ends[j]][-1] += reward_clip[j, 0]
 
+    # rewards 形状: (batch, num_actions)
+    # 所有 action token 位置均包含 KL 散度项，仅最后一个 action token 累加 clipped r 奖励:
+    #   - 非最后位置: reward = -β·KL
+    #   - 最后一个位置: reward = -β·KL + clip(r)
+    # 这种设计符合 RLHF 实践：reward model 分数仅加到 response 最后一个 token，其余位置只有 shaping KL 惩罚。
     return rewards
 
 
@@ -497,16 +504,21 @@ def generate_experiences(samples_list):
         attention_mask = samples.attention_mask
         action_mask = samples.action_mask
         num_actions = samples.num_actions
+    
 
         with torch.no_grad():
             # ── ① 当前 Actor 策略的 log prob（即 π_old，后续更新时作为分母）──
             output = actor_model(seqs, attention_mask=attention_mask)
             logits = output.logits  # (batch, seq_len, vocab_size)
             # 因果 LM：位置 t 的 logits 预测 token t+1
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # (batch, seq_len-1, vocab)
-            # gather：取出实际生成 token 的对数概率
+            # 下面几步是在计算当前 actor 策略下，每个生成 token（动作）的对数概率（log prob）：
+            # 1. F.log_softmax：对 logits（未归一化得分）做 softmax 归一化，并取对数，得到每个位置下每个 token 的 log 概率。
+            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # (batch, seq_len-1, vocab_size)
+            # 2. gather：拿出实际生成的 token 的 log prob。
+            #    seqs[:, 1:] 是目标 token 序列（第一个 token 不预测自己），unsqueeze(-1) 增加一个维度用于 gather 操作。
             log_probs_labels = log_probs.gather(dim=-1, index=seqs[:, 1:].unsqueeze(-1))
-            # 只保留 response 部分 → (batch, num_actions)
+            # 3. 由于一个序列 = prompt + response，我们只保留 response 部分的对数概率（即最后 num_actions 个）。
+            #    squeeze(-1) 去掉最后一维（只剩 (batch, seq_len-1)），[:, -num_actions:] 截取 response 部分。
             action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
 
             # ── ② 参考模型 log prob（冻结的 SFT 模型，用于 KL 惩罚）──
@@ -523,7 +535,8 @@ def generate_experiences(samples_list):
             seq_texts = actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
             reward_model_inputs = reward_tokenizer(seq_texts, return_tensors="pt", padding=True)
             # 输出 shape (batch, 1)：序列级 reward（Outcome Reward Model）
-            r = reward_model(**reward_model_inputs.to(device)).logits
+            r = reward_model(**reward_model_inputs.to(device)).logits  # (batch_size, 1)
+   
 
             # ── ⑤ 逐步 KL 散度 ──
             kl = compute_approx_kl(
